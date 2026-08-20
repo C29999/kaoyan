@@ -17,10 +17,5 @@ Thumbs.db
 # 用户数据 & 错题图片 (不上传, 含浏览器 profile 等大文件)
 image/
 *.json
-!kaoyan_*.json
-!ai_chat_history.json
-!focus_sessions.json
-!README.md
-
-# 日志
 *.log
+.installed
