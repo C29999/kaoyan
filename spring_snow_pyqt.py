@@ -21,9 +21,9 @@ from dataclasses import dataclass, field, asdict
 from datetime import date, timedelta, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from PyQt5.QtCore import Qt, QTimer, QSize, QPoint, QPointF, QRectF, QUrl, QEventLoop, QThread, pyqtSignal, pyqtProperty, QPropertyAnimation, QEasingCurve
+from PyQt5.QtCore import Qt, QTimer, QSize, QPoint, QPointF, QRectF, QRect, QUrl, QEventLoop, QThread, pyqtSignal, pyqtProperty, QPropertyAnimation, QEasingCurve, QEvent
 from PyQt5.QtGui import (
-    QIcon, QPixmap, QImage, QFont, QColor, QPainter, QBrush, QPen, QKeySequence,
+    QIcon, QPixmap, QImage, QFont, QColor, QPainter, QBrush, QPen, QKeySequence, QCursor,
 )
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -32,6 +32,7 @@ from PyQt5.QtWidgets import (
     QAbstractItemView, QDialog, QDialogButtonBox, QTextEdit, QTextBrowser, QShortcut,
     QSizePolicy, QSplitter, QCheckBox, QScrollArea, QFrame, QTabWidget,
     QTreeWidget, QTreeWidgetItem, QListWidget, QListWidgetItem, QGraphicsOpacityEffect,
+    QMenu, QButtonGroup, QRadioButton,
 )
 
 try:
@@ -2083,10 +2084,11 @@ def _ai_panel_get_qss(self, theme: str) -> str:
     # 兜底
     if theme == "dark":
         c = theme_colors or {
-            "bg": "#0f172a", "card": "#1e293b", "border": "#334155",
-            "text": "#f5f0e1", "text2": "#e8e3d3", "text3": "#c9c2b0",
-            "accent": "#fbbf24", "accent_fg": "#0f172a",
-            "nav_hover": "#334155", "nav_active": "#3a2810",
+            # Trae IDE 风格暗色兜底 (与 MainWindow.THEME_COLORS 同步)
+            "bg": "#0d1117", "card": "#161b22", "border": "#30363d",
+            "text": "#f0e6d2", "text2": "#d4c5a8", "text3": "#a89878",
+            "accent": "#3fb950", "accent_fg": "#0d1117",
+            "nav_hover": "#21262d", "nav_active": "#1f6f37",
         }
     else:
         c = theme_colors or {
@@ -2244,12 +2246,12 @@ class StudyStore:
         if s.get("dashboard_date") != today_iso:
             s["dashboard_date"] = today_iso
             default_tasks = s.get("default_tasks") or [
-                {"text": "背 50 个单词", "done": False},
-                {"text": "复习昨日英语错题 10 题", "done": False},
-                {"text": "数学真题 1 节 / 1 章错题回顾", "done": False},
-                {"text": "专业课知识点 30 分钟精读", "done": False},
-                {"text": "阅读 1 篇英语阅读理解并订正", "done": False},
-                {"text": "写择校笔记 1 条（目标院校信息）", "done": False},
+                {"text": "背 50 个单词", "done": False, "urgency": True, "importance": True},
+                {"text": "复习昨日英语错题 10 题", "done": False, "urgency": True, "importance": True},
+                {"text": "数学真题 1 节 / 1 章错题回顾", "done": False, "urgency": False, "importance": True},
+                {"text": "专业课知识点 30 分钟精读", "done": False, "urgency": False, "importance": True},
+                {"text": "阅读 1 篇英语阅读理解并订正", "done": False, "urgency": True, "importance": False},
+                {"text": "写择校笔记 1 条（目标院校信息）", "done": False, "urgency": False, "importance": False},
             ]
             # 给每一项分配 id 方便定位
             s["today_tasks"] = [
@@ -2257,6 +2259,8 @@ class StudyStore:
                     "id": t.get("id") or uuid.uuid4().hex[:8],
                     "text": str(t.get("text", "") or ""),
                     "done": bool(t.get("done", False)),
+                    "urgency": bool(t.get("urgency", True)),
+                    "importance": bool(t.get("importance", True)),
                 }
                 for t in default_tasks
                 if str(t.get("text", "") or "").strip()
@@ -2278,8 +2282,26 @@ class StudyStore:
             if t.get("id") == task_id:
                 t["done"] = bool(done)
                 break
-        # 排序：未完成在前，已完成在后（"做一个就划到底部变灰"）
-        tasks.sort(key=lambda x: (bool(x.get("done")), x.get("__order", 0)))
+        # 排序：未完成在前，已完成在后；同状态按四象限优先级 (Q1>Q2>Q3>Q4)
+        def quadrant_priority(task):
+            urgency = bool(task.get("urgency", True))
+            importance = bool(task.get("importance", True))
+            if urgency and importance: return 0  # Q1 紧急重要
+            if not urgency and importance: return 1  # Q2 重要不紧急
+            if urgency and not importance: return 2  # Q3 紧急不重要
+            return 3  # Q4 不紧急不重要
+        tasks.sort(key=lambda x: (bool(x.get("done")), quadrant_priority(x), x.get("id", "")))
+        self.settings["today_tasks"] = tasks
+        self.save()
+
+    def update_task_quadrant(self, task_id: str, urgency: bool, importance: bool) -> None:
+        """更新任务的四象限标记"""
+        tasks = self.settings.get("today_tasks") or []
+        for t in tasks:
+            if t.get("id") == task_id:
+                t["urgency"] = bool(urgency)
+                t["importance"] = bool(importance)
+                break
         self.settings["today_tasks"] = tasks
         self.save()
 
@@ -3615,6 +3637,807 @@ def make_placeholder_page(title: str, hint: str, color_style: str = "default") -
 
 
 # ===========================================================
+# DesktopWidget (桌面置顶小挂件)
+#   - 无边框 + 置顶 + 工具窗口 (不在任务栏占位)
+#   - 半透明圆角卡片 (TraeCode 风白卡)
+#   - 显示: 考研倒计时 / 目标院校 / 励志语录 / 错题数 / 今日任务进度
+#   - 可拖动 / 右键菜单 / 双击标题栏关闭
+# ===========================================================
+class TaskItemWidget(QWidget):
+    """桌面挂件中的任务项组件 (带勾选框)"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._task_id = ""
+        self._updating = False
+        self.on_toggle = None
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setSpacing(6)
+
+        self.cb = QCheckBox()
+        self.cb.setFixedSize(16, 16)
+        self.cb.setCursor(Qt.PointingHandCursor)
+        self.cb.setStyleSheet(
+            "QCheckBox{background:transparent;border:none;}"
+            "QCheckBox::indicator{width:14px;height:14px;border-radius:3px;border:1.5px solid #cbd5e1;background:white;}"
+            "QCheckBox::indicator:checked{background:#f59e0b;border:1.5px solid #f59e0b;}"
+        )
+        self.cb.stateChanged.connect(self._on_state_changed)
+
+        self.quad_tag = QLabel("Q1")
+        self.quad_tag.setFixedWidth(28)
+        self.quad_tag.setAlignment(Qt.AlignCenter)
+        self.quad_tag.setStyleSheet(
+            "background:#dc2626;color:white;border-radius:3px;font-size:9px;font-weight:700;padding:1px 0px;"
+        )
+
+        self.text_lab = QLabel("")
+        self.text_lab.setWordWrap(False)
+        self.text_lab.setStyleSheet(
+            "color:#0f172a;font-size:11px;font-weight:600;background:transparent;border:none;"
+        )
+
+        lay.addWidget(self.cb)
+        lay.addWidget(self.quad_tag)
+        lay.addWidget(self.text_lab, 1)
+
+        self.hide()
+
+    def set_task(self, task: Dict[str, Any]):
+        self._updating = True
+        self._task_id = str(task.get("id", ""))
+        text = str(task.get("text", "") or "")
+        is_done = bool(task.get("done"))
+        urgency = bool(task.get("urgency", True))
+        importance = bool(task.get("importance", True))
+
+        if urgency and importance:
+            qid, qcolor = "Q1", "#dc2626"
+        elif not urgency and importance:
+            qid, qcolor = "Q2", "#2563eb"
+        elif urgency and not importance:
+            qid, qcolor = "Q3", "#ca8a04"
+        else:
+            qid, qcolor = "Q4", "#6b7280"
+
+        self.quad_tag.setText(qid)
+        self.quad_tag.setStyleSheet(
+            f"background:{qcolor};color:white;border-radius:3px;font-size:9px;font-weight:700;padding:1px 0px;"
+        )
+
+        self.cb.setChecked(is_done)
+        if is_done:
+            self.text_lab.setStyleSheet(
+                "color:#94a3b8;font-size:11px;font-weight:500;background:transparent;border:none;text-decoration:line-through;"
+            )
+            self.quad_tag.setStyleSheet(
+                f"background:{qcolor};color:rgba(255,255,255,180);border-radius:3px;font-size:9px;font-weight:700;padding:1px 0px;text-decoration:line-through;"
+            )
+        else:
+            self.text_lab.setStyleSheet(
+                "color:#0f172a;font-size:11px;font-weight:600;background:transparent;border:none;"
+            )
+
+        self.text_lab.setText(text)
+        self.show()
+        self._updating = False
+
+    def clear(self):
+        self._task_id = ""
+        self._updating = True
+        self.cb.setChecked(False)
+        self.text_lab.setText("")
+        self.hide()
+        self._updating = False
+
+    def _on_state_changed(self, state):
+        if self._updating:
+            return
+        if self.on_toggle and self._task_id:
+            self.on_toggle(self._task_id, state == Qt.Checked)
+
+
+class DesktopWidget(QWidget):
+    def __init__(self, store, theme_colors: Optional[Dict[str, str]] = None,
+                 show_flags: Optional[Dict[str, bool]] = None, parent=None,
+                 on_task_toggle_callback=None, main_window=None):
+        super().__init__(parent)
+        self.store = store
+        self.main_window = main_window  # 保存主窗口引用，用于层级控制
+        self.theme_colors = theme_colors or dict(
+            bg="#f8fafc", card="#ffffff", border="#e2e8f0",
+            text="#0f172a", text2="#475569", text3="#64748b",
+            accent="#f59e0b", accent_fg="#ffffff",
+        )
+        default_flags = {"countdown": True, "quote": True, "target": True,
+                         "wrong": True, "task": True,
+                         "task_list": True, "pomodoro": True}
+        if show_flags:
+            default_flags.update(show_flags)
+        self.show_flags = default_flags
+        self._opacity = 80  # 80% 不透明度 (20% 透明)
+        self._focus_store = FocusStore.load()
+        self._on_task_toggle_cb = on_task_toggle_callback
+
+        # 无边框 + 置顶 + 工具窗口 (不在任务栏占位)
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setMinimumWidth(150)
+        self.setMaximumWidth(800)
+        self.setMinimumHeight(50)
+
+        self._build_ui()
+        self._apply_style()
+
+        # 5s 自动刷新 (倒计时 / 任务进度等)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self.refresh)
+        self._timer.start(5000)
+        self.refresh()
+
+        # 开启鼠标追踪, 让鼠标移动事件在未按下时也能触发
+        self.setMouseTracking(True)
+
+        # 边缘拉伸和靠边隐藏相关
+        self._resize_edge = 8  # 边缘检测宽度
+        self._resize_dir = 0  # 0=无, 1=左, 2=右, 3=上, 4=下
+        self._resizing = False
+        self._resize_start_pos = QPoint()
+        self._resize_start_geo = QRect()
+        self._edge_hidden = False  # 是否靠边隐藏
+        self._edge_side = 0  # 1=左边, 2=右边
+        self._show_width = 300  # 显示时的宽度
+        self._hidden_width = 4  # 隐藏时露出的宽度
+        self._edge_timer = QTimer(self)  # 检测鼠标靠边
+        self._edge_timer.timeout.connect(self._check_edge)
+        self._edge_timer.start(300)
+        self._drag_start_pos = QPoint()
+        self._dragging = False
+
+        # 安装事件过滤器, 捕获子控件的鼠标事件
+        self._install_mouse_filter()
+
+    def _build_ui(self):
+        root = QWidget()
+        root.setObjectName("widgetRoot")
+        _lay = QVBoxLayout(self)
+        _lay.setContentsMargins(0, 0, 0, 0)
+        _lay.addWidget(root)
+        lay = QVBoxLayout(root)
+        lay.setContentsMargins(14, 12, 14, 14)
+        lay.setSpacing(10)
+
+        # 标题栏 (可双击关闭)
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(8)
+        self.title_lab = QLabel("春雪考研 · 挂件")
+        self.title_lab.setStyleSheet(
+            "color:#0f172a;font-size:12px;font-weight:700;background:transparent;border:none;"
+        )
+        self.btn_close = QPushButton("×")
+        self.btn_close.setFixedSize(20, 20)
+        self.btn_close.setCursor(Qt.PointingHandCursor)
+        self.btn_close.setStyleSheet(
+            "QPushButton{background:transparent;border:none;color:#94a3b8;font-size:16px;font-weight:700;}"
+            "QPushButton:hover{color:#dc2626;}"
+        )
+        self.btn_close.clicked.connect(self.hide)
+        title_row.addWidget(self.title_lab)
+        title_row.addStretch(1)
+        title_row.addWidget(self.btn_close)
+        lay.addLayout(title_row)
+
+        # 倒计时
+        self.cd_row = QWidget()
+        cd_lay = QVBoxLayout(self.cd_row)
+        cd_lay.setContentsMargins(0, 0, 0, 0)
+        cd_lay.setSpacing(2)
+        self.cd_num = QLabel("--")
+        self.cd_num.setAlignment(Qt.AlignCenter)
+        self.cd_num.setStyleSheet(
+            "color:#dc2626;font-size:48px;font-weight:900;letter-spacing:2px;background:transparent;"
+        )
+        self.cd_unit = QLabel("天")
+        self.cd_unit.setAlignment(Qt.AlignCenter)
+        self.cd_unit.setStyleSheet(
+            "color:#991b1b;font-size:13px;font-weight:700;background:transparent;"
+        )
+        self.cd_target = QLabel("距考研初试")
+        self.cd_target.setAlignment(Qt.AlignCenter)
+        self.cd_target.setStyleSheet(
+            "color:#64748b;font-size:11px;font-weight:500;background:transparent;"
+        )
+        cd_lay.addWidget(self.cd_num)
+        cd_lay.addWidget(self.cd_unit)
+        cd_lay.addWidget(self.cd_target)
+        lay.addWidget(self.cd_row)
+
+        # 分隔线 1
+        self.line1 = QFrame()
+        self.line1.setFrameShape(QFrame.HLine)
+        self.line1.setFixedHeight(1)
+        lay.addWidget(self.line1)
+
+        # 目标院校 / 专业
+        self.target_row = QWidget()
+        tg = QGridLayout(self.target_row)
+        tg.setContentsMargins(0, 0, 0, 0)
+        tg.setVerticalSpacing(4)
+        tg.setHorizontalSpacing(8)
+        self.tg_school_lab = QLabel("目标")
+        self.tg_school_lab.setStyleSheet("color:#94a3b8;font-size:11px;font-weight:600;background:transparent;")
+        self.tg_school_val = QLabel("待定")
+        self.tg_school_val.setStyleSheet("color:#0f172a;font-size:12px;font-weight:700;background:transparent;")
+        self.tg_major_lab = QLabel("专业")
+        self.tg_major_lab.setStyleSheet("color:#94a3b8;font-size:11px;font-weight:600;background:transparent;")
+        self.tg_major_val = QLabel("待定")
+        self.tg_major_val.setStyleSheet("color:#0f172a;font-size:12px;font-weight:700;background:transparent;")
+        tg.addWidget(self.tg_school_lab, 0, 0)
+        tg.addWidget(self.tg_school_val, 0, 1)
+        tg.addWidget(self.tg_major_lab, 1, 0)
+        tg.addWidget(self.tg_major_val, 1, 1)
+        tg.setColumnStretch(1, 1)
+        lay.addWidget(self.target_row)
+
+        # 励志语录
+        self.quote_lab = QLabel("")
+        self.quote_lab.setWordWrap(True)
+        self.quote_lab.setAlignment(Qt.AlignCenter)
+        self.quote_lab.setStyleSheet(
+            "color:#92400e;font-size:12px;font-weight:600;background:transparent;padding:4px;"
+        )
+        lay.addWidget(self.quote_lab)
+
+        # 分隔线 2
+        self.line2 = QFrame()
+        self.line2.setFrameShape(QFrame.HLine)
+        self.line2.setFixedHeight(1)
+        lay.addWidget(self.line2)
+
+        # 底部: 错题数 + 今日任务进度
+        self.stat_row = QWidget()
+        sg = QHBoxLayout(self.stat_row)
+        sg.setContentsMargins(0, 0, 0, 0)
+        sg.setSpacing(8)
+        self.wrong_box = QWidget()
+        wb = QVBoxLayout(self.wrong_box)
+        wb.setContentsMargins(0, 0, 0, 0)
+        wb.setSpacing(0)
+        self.wrong_num = QLabel("0")
+        self.wrong_num.setAlignment(Qt.AlignCenter)
+        self.wrong_num.setStyleSheet("color:#dc2626;font-size:22px;font-weight:900;background:transparent;")
+        self.wrong_lab = QLabel("错题待复习")
+        self.wrong_lab.setAlignment(Qt.AlignCenter)
+        self.wrong_lab.setStyleSheet("color:#94a3b8;font-size:10px;font-weight:500;background:transparent;")
+        wb.addWidget(self.wrong_num)
+        wb.addWidget(self.wrong_lab)
+        self.task_box = QWidget()
+        tb = QVBoxLayout(self.task_box)
+        tb.setContentsMargins(0, 0, 0, 0)
+        tb.setSpacing(0)
+        self.task_num = QLabel("0/0")
+        self.task_num.setAlignment(Qt.AlignCenter)
+        self.task_num.setStyleSheet("color:#8b5cf6;font-size:22px;font-weight:900;background:transparent;")
+        self.task_lab = QLabel("今日任务")
+        self.task_lab.setAlignment(Qt.AlignCenter)
+        self.task_lab.setStyleSheet("color:#94a3b8;font-size:10px;font-weight:500;background:transparent;")
+        tb.addWidget(self.task_num)
+        tb.addWidget(self.task_lab)
+        sg.addWidget(self.wrong_box, 1)
+        sg.addWidget(self.task_box, 1)
+        lay.addWidget(self.stat_row)
+
+        # 分隔线 3
+        self.line3 = QFrame()
+        self.line3.setFrameShape(QFrame.HLine)
+        self.line3.setFixedHeight(1)
+        lay.addWidget(self.line3)
+
+        # 任务列表 (四象限分类, 前3个未完成, 带勾选功能)
+        self.task_list_scroll = QScrollArea()
+        self.task_list_scroll.setWidgetResizable(True)
+        self.task_list_scroll.setFrameShape(QFrame.NoFrame)
+        self.task_list_scroll.setStyleSheet(
+            "QScrollArea{background:transparent;border:none;}"
+            "QScrollBar:vertical{background:transparent;width:6px;}"
+            "QScrollBar::handle:vertical{background:#cbd5e1;border-radius:3px;min-height:20px;}"
+            "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+        )
+        self.task_list_container = QWidget()
+        self.task_list_container.setStyleSheet("background:transparent;")
+        self.task_list_layout = QVBoxLayout(self.task_list_container)
+        self.task_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.task_list_layout.setSpacing(3)
+        self.task_list_title = QLabel("📋 今日重点")
+        self.task_list_title.setStyleSheet(
+            "color:#0f172a;font-size:11px;font-weight:700;background:transparent;border:none;"
+        )
+        self.task_list_layout.addWidget(self.task_list_title)
+        self.task_list_items: List[TaskItemWidget] = []
+        for _ in range(3):
+            item = TaskItemWidget()
+            item.on_toggle = self._on_widget_task_toggle
+            self.task_list_items.append(item)
+            self.task_list_layout.addWidget(item)
+        self.task_list_layout.addStretch(1)
+        self.task_list_scroll.setWidget(self.task_list_container)
+        lay.addWidget(self.task_list_scroll)
+
+        # 番茄时钟
+        self.pomodoro_row = QWidget()
+        pom_lay = QHBoxLayout(self.pomodoro_row)
+        pom_lay.setContentsMargins(0, 0, 0, 0)
+        pom_lay.setSpacing(8)
+        self.pomodoro_icon = QLabel("🍅")
+        self.pomodoro_icon.setAlignment(Qt.AlignCenter)
+        self.pomodoro_icon.setFixedSize(26, 26)
+        self.pomodoro_icon.setStyleSheet(
+            "QLabel{background:#fef2f2;border:1px solid #fecaca;border-radius:13px;font-size:14px;}"
+        )
+        pom_lay.addWidget(self.pomodoro_icon)
+        pom_col = QVBoxLayout()
+        pom_col.setContentsMargins(0, 0, 0, 0)
+        pom_col.setSpacing(0)
+        self.pomodoro_time = QLabel("0 分钟")
+        self.pomodoro_time.setStyleSheet(
+            "color:#dc2626;font-size:13px;font-weight:800;background:transparent;border:none;"
+        )
+        self.pomodoro_sub = QLabel("今日专注 · 0 次完成")
+        self.pomodoro_sub.setStyleSheet(
+            "color:#64748b;font-size:10px;font-weight:500;background:transparent;border:none;"
+        )
+        pom_col.addWidget(self.pomodoro_time)
+        pom_col.addWidget(self.pomodoro_sub)
+        pom_lay.addLayout(pom_col, 1)
+        lay.addWidget(self.pomodoro_row)
+
+        self._apply_flags()
+
+    @staticmethod
+    def _hex_to_rgba(hex_color: str, opacity: int) -> str:
+        """#RRGGBB -> rgba(r,g,b,a) where opacity is 0-100"""
+        h = hex_color.lstrip("#")
+        if len(h) != 6:
+            return hex_color
+        try:
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        except ValueError:
+            return hex_color
+        a = max(0, min(255, int(round(opacity * 255 / 100))))
+        return f"rgba({r},{g},{b},{a})"
+
+    def _apply_style(self):
+        c = self.theme_colors
+        card_bg = self._hex_to_rgba(c.get("card", "#ffffff"), self._opacity)
+        border = c.get("border", "#e2e8f0")
+        text = c.get("text", "#0f172a")
+        text2 = c.get("text2", "#475569")
+        text3 = c.get("text3", "#64748b")
+        self.setStyleSheet(
+            f"QWidget#widgetRoot{{background:{card_bg};border:1px solid {border};border-radius:14px;}}"
+        )
+        self.title_lab.setStyleSheet(
+            f"color:{text};font-size:12px;font-weight:700;background:transparent;border:none;"
+        )
+        self.cd_num.setStyleSheet(
+            f"color:#dc2626;font-size:48px;font-weight:900;letter-spacing:2px;background:transparent;"
+        )
+        self.cd_unit.setStyleSheet(
+            f"color:#991b1b;font-size:13px;font-weight:700;background:transparent;"
+        )
+        self.cd_target.setStyleSheet(
+            f"color:{text2};font-size:11px;font-weight:600;background:transparent;"
+        )
+        self.tg_school_lab.setStyleSheet(
+            f"color:{text2};font-size:11px;font-weight:600;background:transparent;"
+        )
+        self.tg_major_lab.setStyleSheet(
+            f"color:{text2};font-size:11px;font-weight:600;background:transparent;"
+        )
+        self.tg_school_val.setStyleSheet(
+            f"color:{text};font-size:12px;font-weight:700;background:transparent;"
+        )
+        self.tg_major_val.setStyleSheet(
+            f"color:{text};font-size:12px;font-weight:700;background:transparent;"
+        )
+        self.quote_lab.setStyleSheet(
+            f"color:#92400e;font-size:12px;font-weight:700;background:transparent;padding:4px;"
+        )
+        self.wrong_num.setStyleSheet(
+            f"color:#dc2626;font-size:22px;font-weight:900;background:transparent;"
+        )
+        self.task_num.setStyleSheet(
+            f"color:#8b5cf6;font-size:22px;font-weight:900;background:transparent;"
+        )
+        self.wrong_lab.setStyleSheet(
+            f"color:{text2};font-size:10px;font-weight:600;background:transparent;"
+        )
+        self.task_lab.setStyleSheet(
+            f"color:{text2};font-size:10px;font-weight:600;background:transparent;"
+        )
+        self.task_list_title.setStyleSheet(
+            f"color:{text};font-size:11px;font-weight:700;background:transparent;border:none;"
+        )
+        for item in self.task_list_items:
+            item.setStyleSheet(
+                f"color:{text};font-size:11px;font-weight:600;background:transparent;border:none;"
+                f"padding:3px 4px;"
+            )
+        self.pomodoro_time.setStyleSheet(
+            f"color:#dc2626;font-size:13px;font-weight:800;background:transparent;border:none;"
+        )
+        self.pomodoro_sub.setStyleSheet(
+            f"color:{text2};font-size:10px;font-weight:600;background:transparent;border:none;"
+        )
+        for line in (self.line1, self.line2, self.line3):
+            line.setStyleSheet(
+                f"color:{border};background:{border};border:none;max-height:1px;"
+            )
+
+    def set_opacity(self, opacity: int):
+        """设置卡片不透明度 (0-100, 100=完全不透明)"""
+        self._opacity = max(10, min(100, int(opacity)))
+        self._apply_style()
+
+    def _apply_flags(self):
+        """按 show_flags 显示/隐藏各信息块"""
+        f = self.show_flags
+        self.cd_row.setVisible(f.get("countdown", True))
+        need_line1 = f.get("countdown", True) and (
+            f.get("target", True) or f.get("quote", True)
+        )
+        self.line1.setVisible(need_line1)
+        self.target_row.setVisible(f.get("target", True))
+        self.quote_lab.setVisible(f.get("quote", True))
+        self.line2.setVisible(f.get("wrong", True) or f.get("task", True))
+        self.wrong_box.setVisible(f.get("wrong", True))
+        self.task_box.setVisible(f.get("task", True))
+        self.stat_row.setVisible(f.get("wrong", True) or f.get("task", True))
+        show_task_list = f.get("task_list", True)
+        show_pomodoro = f.get("pomodoro", True)
+        self.task_list_scroll.setVisible(show_task_list)
+        self.pomodoro_row.setVisible(show_pomodoro)
+        self.line3.setVisible(show_task_list or show_pomodoro)
+        self.adjustSize()
+
+    def set_always_on_top(self, on_top: bool, main_window=None):
+        """设置窗口是否置顶 (不影响窗口可见性)"""
+        flags = self.windowFlags()
+        if on_top:
+            if not (flags & Qt.WindowStaysOnTopHint):
+                self.setWindowFlags(flags | Qt.WindowStaysOnTopHint)
+                self.show()
+            self.raise_()
+        else:
+            if flags & Qt.WindowStaysOnTopHint:
+                self.setWindowFlags(flags & ~Qt.WindowStaysOnTopHint)
+                self.show()
+            # 如果有主窗口，将挂件放在主窗口后面
+            if main_window is not None:
+                try:
+                    self.stackUnder(main_window)
+                except Exception:
+                    self.lower()
+
+    def refresh(self):
+        try:
+            s = self.store
+            kd = s.kaoyan_date
+            days = (kd - date.today()).days
+            self.cd_num.setText(f"{max(days, 0)}")
+            self.cd_target.setText(f"距 {kd.strftime('%Y-%m-%d')} 考研初试")
+            self.tg_school_val.setText(str(s.settings.get("target_school") or "待定"))
+            self.tg_major_val.setText(str(s.settings.get("target_major") or "待定"))
+            q = s.settings.get("daily_quote") or ""
+            self.quote_lab.setText(f"「{q}」" if q else "")
+            wn = len(getattr(s, "wrong_words", []) or [])
+            self.wrong_num.setText(f"{wn}")
+            tasks = s.settings.get("today_tasks") or []
+            done = sum(1 for t in tasks if t.get("done"))
+            self.task_num.setText(f"{done}/{len(tasks)}")
+            print(f"[挂件refresh] 总任务: {len(tasks)}, 已完成: {done}")
+            # 任务列表: 前3个未完成任务, 按四象限排序
+            def _quad_priority(t):
+                u = bool(t.get("urgency", True))
+                imp = bool(t.get("importance", True))
+                if u and imp: return 0
+                if not u and imp: return 1
+                if u and not imp: return 2
+                return 3
+            pending = sorted(
+                [t for t in tasks if not t.get("done")],
+                key=lambda x: (_quad_priority(x), x.get("id", "")),
+            )[:3]
+            print(f"[挂件refresh] 待显示未完成任务: {len(pending)}")
+            for i, item in enumerate(self.task_list_items):
+                if i < len(pending):
+                    item.set_task(pending[i])
+                else:
+                    item.clear()
+            # 番茄时钟
+            total_min = self._focus_store.today_total_minutes()
+            completed = self._focus_store.today_completed_count()
+            self.pomodoro_time.setText(f"{total_min} 分钟")
+            self.pomodoro_sub.setText(f"今日专注 · {completed} 次完成")
+        except Exception as e:
+            print(f"[挂件refresh] 异常: {e}")
+
+    def _on_widget_task_toggle(self, task_id: str, done: bool):
+        """挂件中勾选任务的处理方法"""
+        try:
+            self.store.toggle_task_done(task_id, done)
+            if self._on_task_toggle_cb:
+                self._on_task_toggle_cb()
+            self.refresh()
+        except Exception:
+            pass
+
+    # ---- 事件过滤器, 捕获子控件鼠标事件 ----
+    def _install_mouse_filter(self):
+        """递归安装事件过滤器到所有子控件"""
+        self.installEventFilter(self)
+        for child in self.findChildren(QWidget):
+            child.setMouseTracking(True)
+            child.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        """事件过滤器, 将子控件的鼠标事件转发到父控件处理"""
+        if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            gpos = obj.mapToGlobal(event.pos())
+            lpos = self.mapFromGlobal(gpos)
+            # 保存事件信息供 mousePressEvent 使用
+            self._saved_mouse_pos = lpos
+            self._saved_mouse_global_pos = gpos
+            self._saved_mouse_button = Qt.LeftButton
+            self._handle_mouse_press(lpos, gpos, Qt.LeftButton)
+            return True
+        elif event.type() == QEvent.MouseMove:
+            gpos = obj.mapToGlobal(event.pos())
+            lpos = self.mapFromGlobal(gpos)
+            self._saved_mouse_pos = lpos
+            self._saved_mouse_global_pos = gpos
+            self._handle_mouse_move(lpos, gpos, event.buttons())
+            return True
+        elif event.type() == QEvent.MouseButtonRelease:
+            self._handle_mouse_release()
+            return True
+        elif event.type() == QEvent.Enter:
+            self.enterEvent(event)
+            return False
+        elif event.type() == QEvent.Leave:
+            self.leaveEvent(event)
+            return False
+        return super().eventFilter(obj, event)
+
+    def _handle_mouse_press(self, pos: QPoint, global_pos: QPoint, button: Qt.MouseButton):
+        """处理鼠标按下事件"""
+        self._resize_dir = self._get_edge_dir(pos)
+        if self._resize_dir > 0:
+            self._resizing = True
+            self._resize_start_pos = global_pos
+            self._resize_start_geo = self.geometry()
+            self._edge_hidden = False
+        else:
+            self._dragging = True
+            self._drag_start_pos = global_pos - self.frameGeometry().topLeft()
+
+    def _handle_mouse_move(self, pos: QPoint, global_pos: QPoint, buttons: Qt.MouseButtons):
+        """处理鼠标移动事件"""
+        if self._resizing:
+            delta = global_pos - self._resize_start_pos
+            geo = QRect(self._resize_start_geo)
+            min_w, min_h = self.minimumWidth(), self.minimumHeight()
+            max_w, max_h = self.maximumWidth(), self.maximumHeight()
+            if self._resize_dir == 1:  # 左边缘
+                new_w = max(min_w, min(max_w, geo.width() - delta.x()))
+                geo.setLeft(geo.right() - new_w + 1)
+                geo.setWidth(new_w)
+            elif self._resize_dir == 2:  # 右边缘
+                new_w = max(min_w, min(max_w, geo.width() + delta.x()))
+                geo.setWidth(new_w)
+            elif self._resize_dir == 3:  # 上边缘
+                new_h = max(min_h, min(max_h, geo.height() - delta.y()))
+                geo.setTop(geo.bottom() - new_h + 1)
+                geo.setHeight(new_h)
+            elif self._resize_dir == 4:  # 下边缘
+                new_h = max(min_h, min(max_h, geo.height() + delta.y()))
+                geo.setHeight(new_h)
+            self.setGeometry(geo)
+            self._show_width = geo.width()
+            self._update_cursor()
+        elif self._dragging:
+            self.move(global_pos - self._drag_start_pos)
+            self._update_cursor()
+        else:
+            self._update_cursor()
+
+    def _handle_mouse_release(self):
+        """处理鼠标释放事件"""
+        if self._resizing:
+            self._resizing = False
+            self._check_snap_to_edge()
+        elif self._dragging:
+            self._dragging = False
+            self._check_snap_to_edge()
+        self._update_cursor()
+
+    # ---- 边缘检测和拉伸 ----
+    def _get_edge_dir(self, pos: QPoint) -> int:
+        """获取鼠标所在边缘方向: 0=无, 1=左, 2=右, 3=上, 4=下"""
+        edge = self._resize_edge
+        geo = self.rect()
+        x, y, w, h = geo.x(), geo.y(), geo.width(), geo.height()
+        near_left = pos.x() < x + edge
+        near_right = pos.x() > x + w - edge
+        near_top = pos.y() < y + edge
+        near_bottom = pos.y() > y + h - edge
+        if near_left:
+            return 1
+        elif near_right:
+            return 2
+        elif near_top:
+            return 3
+        elif near_bottom:
+            return 4
+        return 0
+
+    def _update_cursor(self):
+        """根据边缘方向更新光标"""
+        d = self._get_edge_dir(self.mapFromGlobal(QCursor.pos()))
+        self._resize_dir = d
+        cursors = {
+            0: Qt.ArrowCursor,
+            1: Qt.SizeHorCursor,
+            2: Qt.SizeHorCursor,
+            3: Qt.SizeVerCursor,
+            4: Qt.SizeVerCursor,
+        }
+        self.setCursor(cursors.get(d, Qt.ArrowCursor))
+
+    # ---- 拖动移动 / 拉伸 (保留用于处理控件本身的事件) ----
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._handle_mouse_press(e.pos(), e.globalPos(), e.button())
+            e.accept()
+
+    def mouseMoveEvent(self, e):
+        self._handle_mouse_move(e.pos(), e.globalPos(), e.buttons())
+        e.accept()
+
+    def mouseReleaseEvent(self, e):
+        self._handle_mouse_release()
+
+    def _check_snap_to_edge(self):
+        """检查窗口是否靠近屏幕边缘，是则自动吸附隐藏"""
+        screen_geo = QApplication.primaryScreen().availableGeometry()
+        geo = self.geometry()
+        margin = 30  # 靠近边缘的判定距离
+        # 检查右边
+        if abs(geo.right() - screen_geo.right()) < margin:
+            self._edge_side = 2
+            self._snap_to_edge(2)
+        # 检查左边
+        elif abs(geo.left() - screen_geo.left()) < margin:
+            self._edge_side = 1
+            self._snap_to_edge(1)
+
+    def _snap_to_edge(self, side: int):
+        """吸附到边缘并隐藏"""
+        screen_geo = QApplication.primaryScreen().availableGeometry()
+        self._edge_side = side
+        self._edge_hidden = True
+        self._show_width = self.width()
+        if side == 2:  # 右边
+            self._hidden_pos = QPoint(screen_geo.right() - self._hidden_width, self.y())
+        else:  # 左边
+            self._hidden_pos = QPoint(screen_geo.left() - self._hidden_width + self._hidden_width, self.y())
+        self.hide()
+        self._hidden_pos = QPoint(screen_geo.right() + self._hidden_width - 2 * self._hidden_width - self.width() + self._hidden_width, self.y())
+        # 简化: 只保留 4px 露出
+        if side == 2:
+            new_x = screen_geo.right() - self._hidden_width
+        else:
+            new_x = screen_geo.left() - self.width() + self._hidden_width
+        self.move(new_x, self.y())
+        self.show()
+        self.raise_()
+
+    def _expand_from_edge(self):
+        """从边缘展开"""
+        screen_geo = QApplication.primaryScreen().availableGeometry()
+        self._edge_hidden = False
+        if self._edge_side == 2:  # 右边展开
+            new_x = screen_geo.right() - self._show_width
+        else:  # 左边展开
+            new_x = screen_geo.left()
+        self.move(new_x, self.y())
+        self.raise_()
+
+    def _check_edge(self):
+        """定时检查鼠标是否靠近隐藏的窗口"""
+        if not self._edge_hidden:
+            return
+        mouse_pos = QCursor.pos()
+        frame = self.frameGeometry()
+        expand_area = frame.adjusted(-30, 0, 30, 0)
+        if expand_area.contains(mouse_pos):
+            self._expand_from_edge()
+
+    def enterEvent(self, e):
+        """鼠标进入时，如果是隐藏状态则展开"""
+        if self._edge_hidden:
+            self._expand_from_edge()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        """鼠标离开时，如果靠近边缘则隐藏"""
+        if not self._dragging and not self._resizing:
+            mouse_pos = QCursor.pos()
+            frame = self.frameGeometry()
+            margin = 15
+            if self._edge_side == 2:
+                # 鼠标是否在右边边缘
+                screen_geo = QApplication.primaryScreen().availableGeometry()
+                if mouse_pos.x() > screen_geo.right() - 50 or frame.right() + margin < mouse_pos.x():
+                    self._snap_to_edge(self._edge_side)
+            elif self._edge_side == 1:
+                screen_geo = QApplication.primaryScreen().availableGeometry()
+                if mouse_pos.x() < screen_geo.left() + 50 or frame.left() - margin > mouse_pos.x():
+                    self._snap_to_edge(self._edge_side)
+        super().leaveEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        if e.y() < 40:
+            self.hide()
+
+    def contextMenuEvent(self, e):
+        m = QMenu(self)
+        a_refresh = m.addAction("🔄 立即刷新")
+        m.addSeparator()
+        a_expand_edge = m.addAction("📤 从边缘展开")
+        m.addSeparator()
+        is_top = bool(self.windowFlags() & Qt.WindowStaysOnTopHint)
+        a_top = m.addAction("📌 取消置顶" if is_top else "📌 设为置顶")
+        m.addSeparator()
+        # 显示模式: 全部展开 / 精简模式
+        show_all = all(self.show_flags.get(k, True) for k in
+                       ("countdown", "quote", "target", "wrong", "task", "task_list", "pomodoro"))
+        a_expand = m.addAction("📐 精简模式" if show_all else "📐 全部展开")
+        m.addSeparator()
+        # 透明度子菜单
+        op_menu = m.addMenu("🎨 透明度")
+        for op_val, op_label in [(30, "30% (透明)"), (50, "50%"), (70, "70%"), (80, "80% (推荐)"), (100, "100% (不透明)")]:
+            a = op_menu.addAction(op_label)
+            a.setCheckable(True)
+            a.setChecked(self._opacity == op_val)
+            a.triggered.connect(lambda _=False, v=op_val: self.set_opacity(v))
+        m.addSeparator()
+        a_close = m.addAction("❌ 关闭挂件")
+        act = m.exec_(e.globalPos())
+        if act is a_refresh:
+            self.refresh()
+        elif act is a_expand_edge:
+            self._expand_from_edge()
+        elif act is a_top:
+            is_top = bool(self.windowFlags() & Qt.WindowStaysOnTopHint)
+            self.set_always_on_top(not is_top, self.main_window)
+        elif act is a_expand:
+            if show_all:
+                for k in ("quote", "target", "task_list", "pomodoro"):
+                    self.show_flags[k] = False
+            else:
+                for k in ("countdown", "quote", "target", "wrong", "task", "task_list", "pomodoro"):
+                    self.show_flags[k] = True
+            self._apply_flags()
+        elif act is a_close:
+            self.hide()
+
+
+# ===========================================================
 # MainWindow (仿上位机 Frameless + border-image)
 # ===========================================================
 class MainWindow(QMainWindow):
@@ -3628,12 +4451,14 @@ class MainWindow(QMainWindow):
         ("course",    "网课学习区", "网页听课 · Markdown 笔记"),
         ("pdf",       "PDF阅读", "讲义 · 真题 · 标注笔记"),
         ("focus",     "专注",   "番茄钟 · 计时 · 统计"),
+        ("widget",    "挂件",   "桌面置顶 · 倒计时 · 错题速览"),
     ]
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
+        self.setFocusPolicy(Qt.StrongFocus)
         self.resize(1320, 820)
         self.setMinimumSize(1080, 700)
         self._drag_pos: Optional[QPoint] = None
@@ -3642,10 +4467,41 @@ class MainWindow(QMainWindow):
         self.page_stack = QStackedWidget()
         self._nav_buttons: List[QPushButton] = []
         self._build_ui()
+        # 安装事件过滤器监听窗口激活状态
+        self.installEventFilter(self)
+        # 双击空格键检测相关
+        self._last_space_time = 0  # 上次按下空格键的时间
+        self._space_double_click_interval = 500  # 双击间隔 (毫秒)
+        self._space_was_pressed = False  # 空格键上一帧是否按下
+        # 启动全局键盘监听定时器 (使用 GetAsyncKeyState 检测按键状态)
+        self._keyboard_timer = QTimer(self)
+        self._keyboard_timer.timeout.connect(self._check_global_keys)
+        self._keyboard_timer.start(50)  # 50ms 间隔检查
 
     # ---- 全局事件过滤器: 浏览器卡片放大时 box/主窗口尺寸变化立刻重算 view 几何 ----
     def eventFilter(self, obj, event):
         et = event.type() if event is not None else None
+        # 监听主窗口激活/失焦事件，控制挂件置顶状态
+        if obj is self:
+            try:
+                from PyQt5.QtCore import QEvent as _QE
+                if et == _QE.WindowActivate:
+                    # 主窗口激活时，挂件降级到普通窗口并放在主窗口后面
+                    w = getattr(self, "_desktop_widget", None)
+                    if w is not None:
+                        w.set_always_on_top(False, self)
+                elif et == _QE.WindowDeactivate:
+                    # 主窗口失焦时，恢复挂件置顶
+                    w = getattr(self, "_desktop_widget", None)
+                    if w is not None:
+                        w.set_always_on_top(True)
+                elif et == _QE.KeyPress:
+                    # 监听空格键，检测双击以切换挂件显示
+                    key = getattr(event, "key", lambda: 0)()
+                    if key == Qt.Key_Space:
+                        self._check_space_double_click()
+            except Exception:
+                pass
         if getattr(self, "_course_maximized", False):
             want = False
             try:
@@ -3669,6 +4525,44 @@ class MainWindow(QMainWindow):
                 pass
         # 再交给父类
         return super().eventFilter(obj, event)
+
+    def _check_global_keys(self):
+        """全局键盘按键检测 (使用 Windows API)"""
+        try:
+            import ctypes
+            # VK_SPACE = 0x20
+            # GetAsyncKeyState 返回值: 最高位为1表示按下, 最低位为1表示自上次调用后按下过
+            state = ctypes.windll.user32.GetAsyncKeyState(0x20)
+            is_pressed = bool(state & 0x8000)  # 最高位: 当前是否按下
+            # 检测按键按下事件 (从未按下变为按下)
+            if is_pressed and not self._space_was_pressed:
+                self._check_space_double_click()
+            self._space_was_pressed = is_pressed
+        except Exception:
+            pass
+
+    def _check_space_double_click(self):
+        """检测双击空格键，切换挂件显示状态"""
+        import time
+        current_time = int(time.time() * 1000)  # 转换为毫秒
+        time_diff = current_time - self._last_space_time
+        if 0 < time_diff <= self._space_double_click_interval:
+            # 检测到双击
+            self._toggle_desktop_widget()
+            self._last_space_time = 0  # 重置
+        else:
+            self._last_space_time = current_time
+
+    def _toggle_desktop_widget(self):
+        """切换桌面挂件的显示状态"""
+        widget = getattr(self, "_desktop_widget", None)
+        if widget is None:
+            return
+        if widget.isVisible():
+            widget.hide()
+        else:
+            widget.show()
+            widget.set_always_on_top(True)
 
     # ---- 关闭窗口时: 先归位独立窗口/退出放大，再杀 Edge 子进程，防止子进程残留 ----
     def closeEvent(self, e):
@@ -4023,6 +4917,8 @@ class MainWindow(QMainWindow):
                 page = self._build_pdf_page(name)
             elif key == "focus":
                 page = self._build_focus_page(name)
+            elif key == "widget":
+                page = self._build_widget_page(name)
             else:
                 page = make_placeholder_page(name, "")
             self.pages[key] = page
@@ -4180,8 +5076,13 @@ class MainWindow(QMainWindow):
         btn_reset_task = QPushButton("重置")
         btn_reset_task.setCursor(Qt.PointingHandCursor)
         btn_reset_task.clicked.connect(self._on_reset_tasks)
+        btn_sync_widget = QPushButton("🔄 同步挂件")
+        btn_sync_widget.setCursor(Qt.PointingHandCursor)
+        btn_sync_widget.setToolTip("立即将任务列表同步到桌面挂件")
+        btn_sync_widget.clicked.connect(lambda: self._refresh_widget_if_exists())
         task_head.addWidget(self.dash_task_progress)
         task_head.addStretch(1)
+        task_head.addWidget(btn_sync_widget)
         task_head.addWidget(btn_add_task)
         task_head.addWidget(btn_reset_task)
 
@@ -4196,6 +5097,7 @@ class MainWindow(QMainWindow):
         self.dash_task_lay.setSpacing(8)
         self.dash_task_lay.addStretch(1)
         self._dash_task_stretch_idx = self.dash_task_lay.count() - 1
+        self._task_rebuilding = False
         scroll.setWidget(self.dash_task_container)
 
         task_lay = QVBoxLayout(task_group)
@@ -4391,108 +5293,249 @@ class MainWindow(QMainWindow):
 
     # ---- 今日任务 ----
     def _rebuild_task_rows(self):
+        self._task_rebuilding = True
+        try:
+            tasks = self.store.settings.get("today_tasks") or []
+            stretch_idx = -1
+            for i in range(self.dash_task_lay.count() - 1, -1, -1):
+                it = self.dash_task_lay.itemAt(i)
+                if it is None:
+                    continue
+                if it.spacerItem() is not None:
+                    stretch_idx = i
+                    break
+            i = 0
+            while i < self.dash_task_lay.count():
+                item = self.dash_task_lay.itemAt(i)
+                if item is None:
+                    i += 1
+                    continue
+                if item.spacerItem() is not None:
+                    i += 1
+                    continue
+                taken = self.dash_task_lay.takeAt(i)
+                w = taken.widget()
+                if w is not None:
+                    w.setParent(None)
+                    w.deleteLater()
+            tasks_sorted = sorted(tasks, key=lambda x: (bool(x.get("done")), x.get("id", "")))
+
+            done = 0
+            insert_at = stretch_idx if stretch_idx >= 0 else self.dash_task_lay.count()
+            for t in tasks_sorted:
+                if t.get("done"):
+                    done += 1
+                row = QFrame()
+                row.setFrameShape(QFrame.NoFrame)
+                row_cb = QHBoxLayout(row)
+                row_cb.setContentsMargins(10, 8, 10, 8)
+                row_cb.setSpacing(8)
+
+                cb = QCheckBox()
+                tid = str(t.get("id", ""))
+                text = str(t.get("text", "") or "")
+                is_done = bool(t.get("done"))
+                cb.setProperty("task_id", tid)
+                cb.setChecked(is_done)
+
+                # 四象限标签
+                urgency = bool(t.get("urgency", True))
+                importance = bool(t.get("importance", True))
+                quad_label, quad_color = self._get_quadrant_info(urgency, importance)
+                quad_tag = QLabel(quad_label)
+                quad_tag.setProperty("quadrant", True)
+                quad_tag.setFixedWidth(36)
+                quad_tag.setAlignment(Qt.AlignCenter)
+                quad_tag.setStyleSheet(
+                    f"background: {quad_color}; color: white; border-radius: 4px;"
+                    " font-size: 10px; font-weight: 700; padding: 2px 0px;"
+                )
+                quad_tag.setToolTip(f"优先级: {quad_label}")
+
+                lab = QLabel(text)
+                lab.setWordWrap(True)
+                lab.setProperty("task_text", True)
+                lab.setStyleSheet("background: transparent;")
+
+                btn_del = QPushButton("✕")
+                btn_del.setFixedSize(26, 26)
+                btn_del.setCursor(Qt.PointingHandCursor)
+                btn_del.setStyleSheet(
+                    "QPushButton { background: transparent; color: rgba(120,90,50,130);"
+                    " border: none; border-radius: 13px; font-size: 13px; }"
+                    "QPushButton:hover { background: rgba(220,60,60,140); color: white; }"
+                )
+                btn_del.setProperty("task_id", tid)
+                btn_del.clicked.connect(lambda _=False, b=btn_del: self._on_delete_task(b))
+
+                row_cb.addWidget(cb)
+                row_cb.addWidget(quad_tag)
+                row_cb.addWidget(lab, 1)
+                row_cb.addWidget(btn_del)
+
+                if is_done:
+                    row.setStyleSheet(
+                        "QFrame { background: rgba(180,180,180,45);"
+                        " border: 1px solid rgba(150,150,150,90); border-radius: 10px; }"
+                    )
+                    cb.setStyleSheet(
+                        "QCheckBox { color: rgba(90,90,90,235); font-size: 13px; }"
+                    )
+                    lab.setStyleSheet(
+                        "background: transparent; color: rgba(90,90,90,230);"
+                        " text-decoration: line-through; font-size: 13px;"
+                    )
+                    quad_tag.setStyleSheet(
+                        f"background: {quad_color}; color: rgba(255,255,255,180); border-radius: 4px;"
+                        " font-size: 10px; font-weight: 700; padding: 2px 0px; text-decoration: line-through;"
+                    )
+                else:
+                    row.setStyleSheet(
+                        "QFrame { background: rgba(255,255,255,110);"
+                        " border: 1px solid rgba(200,170,120,130); border-radius: 10px; }"
+                    )
+                    cb.setStyleSheet(
+                        "QCheckBox { color: #3a280b; font-size: 14px; font-weight: 700; }"
+                    )
+                    lab.setStyleSheet(
+                        "background: transparent; color: #2a1f0f; font-size: 14px;"
+                        " font-weight: 600;"
+                    )
+                cb.stateChanged.connect(
+                    lambda state, t_id=tid: self._on_task_toggle(t_id, state == Qt.Checked)
+                )
+
+                self.dash_task_lay.insertWidget(insert_at, row)
+                insert_at += 1
+            total = len(tasks_sorted)
+            self.dash_task_progress.setText(f"{done} / {total}  已完成")
+        finally:
+            self._task_rebuilding = False
+
+    @staticmethod
+    def _get_quadrant_info(urgency: bool, importance: bool) -> Tuple[str, str]:
+        """获取四象限标签和颜色"""
+        if urgency and importance:
+            return "Q1", "#dc2626"  # 红色
+        elif not urgency and importance:
+            return "Q2", "#2563eb"  # 蓝色
+        elif urgency and not importance:
+            return "Q3", "#ca8a04"  # 黄色
+        else:
+            return "Q4", "#6b7280"  # 灰色
+
+    def _on_task_toggle(self, task_id: str, done: bool):
+        if getattr(self, "_task_rebuilding", False):
+            return
+        self.store.toggle_task_done(task_id, done)
+        self._refresh_task_order_only()
+        self._refresh_widget_if_exists()
+
+    def _refresh_task_order_only(self):
+        """仅刷新任务排序与样式, 不重建全部 (勾选后平滑重排)"""
+        if getattr(self, "_task_rebuilding", False):
+            return
         tasks = self.store.settings.get("today_tasks") or []
-        # 找 stretch spacer：优先用记录的 _dash_task_stretch_idx（若还存在且是 spacer），否则用最后一项
+
+        def quadrant_priority(task):
+            urgency = bool(task.get("urgency", True))
+            importance = bool(task.get("importance", True))
+            if urgency and importance: return 0
+            if not urgency and importance: return 1
+            if urgency and not importance: return 2
+            return 3
+
+        tasks_sorted = sorted(tasks, key=lambda x: (bool(x.get("done")), quadrant_priority(x), x.get("id", "")))
+        new_order = [str(t.get("id", "")) for t in tasks_sorted]
+
         stretch_idx = -1
         for i in range(self.dash_task_lay.count() - 1, -1, -1):
             it = self.dash_task_lay.itemAt(i)
-            if it is None:
-                continue
-            if it.spacerItem() is not None:
+            if it is not None and it.spacerItem() is not None:
                 stretch_idx = i
                 break
-        # 先清空旧 widgets（但保留 stretch spacer）
-        i = 0
-        while i < self.dash_task_lay.count():
+
+        # 收集现有行
+        rows: Dict[str, QFrame] = {}
+        for i in range(self.dash_task_lay.count()):
             item = self.dash_task_lay.itemAt(i)
-            if item is None:
-                i += 1
+            if item is None or item.spacerItem() is not None:
                 continue
-            if item.spacerItem() is not None:
-                i += 1
-                continue
-            # 非 spacer, 取走
-            taken = self.dash_task_lay.takeAt(i)
-            w = taken.widget()
+            w = item.widget()
             if w is not None:
-                w.setParent(None)
-                w.deleteLater()
-        tasks_sorted = sorted(tasks, key=lambda x: (bool(x.get("done")), x.get("id", "")))
+                tid_prop = ""
+                for child in w.findChildren(QCheckBox):
+                    tid_prop = str(child.property("task_id") or "")
+                    break
+                if tid_prop:
+                    rows[tid_prop] = w
 
-        done = 0
         insert_at = stretch_idx if stretch_idx >= 0 else self.dash_task_lay.count()
-        for t in tasks_sorted:
-            if t.get("done"):
-                done += 1
-            row = QFrame()
-            row.setFrameShape(QFrame.NoFrame)
-            row_cb = QHBoxLayout(row)
-            row_cb.setContentsMargins(10, 8, 10, 8)
-            row_cb.setSpacing(10)
-
-            cb = QCheckBox()
-            tid = str(t.get("id", ""))
-            text = str(t.get("text", "") or "")
+        done = 0
+        for tid in new_order:
+            t = next((x for x in tasks_sorted if str(x.get("id", "")) == tid), None)
+            if t is None:
+                continue
             is_done = bool(t.get("done"))
-            cb.setProperty("task_id", tid)
-            cb.setChecked(is_done)
-
-            lab = QLabel(text)
-            lab.setWordWrap(True)
-            lab.setStyleSheet("background: transparent;")
-
-            btn_del = QPushButton("✕")
-            btn_del.setFixedSize(26, 26)
-            btn_del.setCursor(Qt.PointingHandCursor)
-            btn_del.setStyleSheet(
-                "QPushButton { background: transparent; color: rgba(120,90,50,130);"
-                " border: none; border-radius: 13px; font-size: 13px; }"
-                "QPushButton:hover { background: rgba(220,60,60,140); color: white; }"
-            )
-            btn_del.setProperty("task_id", tid)
-            btn_del.clicked.connect(lambda _=False, b=btn_del: self._on_delete_task(b))
-
-            row_cb.addWidget(cb)
-            row_cb.addWidget(lab, 1)
-            row_cb.addWidget(btn_del)
-
-            # 样式：已完成变灰 + 删除线 + 略小的圆角卡片
+            if is_done:
+                done += 1
+            row = rows.get(tid)
+            if row is None:
+                continue
+            # 更新样式
             if is_done:
                 row.setStyleSheet(
                     "QFrame { background: rgba(180,180,180,45);"
                     " border: 1px solid rgba(150,150,150,90); border-radius: 10px; }"
-                )
-                cb.setStyleSheet(
-                    "QCheckBox { color: rgba(90,90,90,235); font-size: 13px; }"
-                )
-                lab.setStyleSheet(
-                    "background: transparent; color: rgba(90,90,90,230);"
-                    " text-decoration: line-through; font-size: 13px;"
                 )
             else:
                 row.setStyleSheet(
                     "QFrame { background: rgba(255,255,255,110);"
                     " border: 1px solid rgba(200,170,120,130); border-radius: 10px; }"
                 )
+            # 更新四象限标签
+            urgency = bool(t.get("urgency", True))
+            importance = bool(t.get("importance", True))
+            quad_label, quad_color = self._get_quadrant_info(urgency, importance)
+            for qt in row.findChildren(QLabel):
+                if qt.property("quadrant"):
+                    qt.setText(quad_label)
+                    if is_done:
+                        qt.setStyleSheet(
+                            f"background: {quad_color}; color: rgba(255,255,255,180); border-radius: 4px;"
+                            " font-size: 10px; font-weight: 700; padding: 2px 0px; text-decoration: line-through;"
+                        )
+                    else:
+                        qt.setStyleSheet(
+                            f"background: {quad_color}; color: white; border-radius: 4px;"
+                            " font-size: 10px; font-weight: 700; padding: 2px 0px;"
+                        )
+            # 更新文字样式
+            for cb in row.findChildren(QCheckBox):
+                cb.blockSignals(True)
+                cb.setChecked(is_done)
+                cb.blockSignals(False)
                 cb.setStyleSheet(
+                    "QCheckBox { color: rgba(90,90,90,235); font-size: 13px; }"
+                    if is_done else
                     "QCheckBox { color: #3a280b; font-size: 14px; font-weight: 700; }"
                 )
-                lab.setStyleSheet(
-                    "background: transparent; color: #2a1f0f; font-size: 14px;"
-                    " font-weight: 600;"
-                )
-            cb.stateChanged.connect(
-                lambda state, t_id=tid: self._on_task_toggle(t_id, state == Qt.Checked)
-            )
-
+            for lab in row.findChildren(QLabel):
+                if lab.property("task_text"):
+                    lab.setStyleSheet(
+                        "background: transparent; color: rgba(90,90,90,230);"
+                        " text-decoration: line-through; font-size: 13px;"
+                        if is_done else
+                        "background: transparent; color: #2a1f0f; font-size: 14px;"
+                        " font-weight: 600;"
+                    )
+            # 移动到正确位置
+            self.dash_task_lay.removeWidget(row)
             self.dash_task_lay.insertWidget(insert_at, row)
             insert_at += 1
+
         total = len(tasks_sorted)
         self.dash_task_progress.setText(f"{done} / {total}  已完成")
-
-    def _on_task_toggle(self, task_id: str, done: bool):
-        self.store.toggle_task_done(task_id, done)
-        self._rebuild_task_rows()
 
     def _on_delete_task(self, btn: QPushButton):
         tid = str(btn.property("task_id"))
@@ -4500,19 +5543,81 @@ class MainWindow(QMainWindow):
         self.store.settings["today_tasks"] = tasks
         self.store.save()
         self._rebuild_task_rows()
+        self._refresh_widget_if_exists()
 
     def _on_add_task(self):
-        txt, ok = self._dash_input_dialog("添加今日任务", "要做什么？ (例如：阅读 1 篇英语阅读)")
-        if not ok:
+        dlg = self._task_input_dialog()
+        if dlg is None:
             return
+        txt, urgency, importance = dlg
         txt = txt.strip()
         if not txt:
             return
         tasks = self.store.settings.get("today_tasks") or []
-        tasks.append({"id": uuid.uuid4().hex[:8], "text": txt, "done": False})
+        tasks.append({
+            "id": uuid.uuid4().hex[:8],
+            "text": txt,
+            "done": False,
+            "urgency": urgency,
+            "importance": importance,
+        })
         self.store.settings["today_tasks"] = tasks
         self.store.save()
         self._rebuild_task_rows()
+        self._refresh_widget_if_exists()
+
+    def _task_input_dialog(self):
+        """带四象限选择的任务添加对话框"""
+        dlg = QDialog(self._page if hasattr(self, "_page") else self)
+        dlg.setWindowTitle("添加今日任务")
+        dlg.resize(440, 200)
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(16, 14, 16, 14)
+        v.setSpacing(10)
+
+        v.addWidget(QLabel("要做什么？ (例如：阅读 1 篇英语阅读)"))
+        edit = QLineEdit()
+        v.addWidget(edit)
+
+        v.addWidget(QLabel("优先级 (四象限法):"))
+        quad_row = QHBoxLayout()
+        quad_row.setSpacing(8)
+        self._task_quad_group = QButtonGroup(dlg)
+        self._task_quad_group.setExclusive(True)
+
+        quadrants = [
+            ("q1", "🔴 Q1 紧急重要", True, True),
+            ("q2", "🔵 Q2 重要不紧急", False, True),
+            ("q3", "🟡 Q3 紧急不重要", True, False),
+            ("q4", "⚪ Q4 不紧急不重要", False, False),
+        ]
+        self._task_quad_data = {}
+        for qid, qlabel, urg, imp in quadrants:
+            rb = QRadioButton(qlabel)
+            rb.setStyleSheet(
+                "QRadioButton{color:#334155;font-size:12px;font-weight:600;padding:4px;}"
+            )
+            self._task_quad_group.addButton(rb)
+            self._task_quad_data[rb] = (urg, imp)
+            quad_row.addWidget(rb)
+            if qid == "q1":
+                rb.setChecked(True)
+        quad_row.addStretch(1)
+        v.addLayout(quad_row)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText("确定")
+        bb.button(QDialogButtonBox.Cancel).setText("取消")
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        edit.setFocus()
+
+        if dlg.exec_() == QDialog.Accepted:
+            selected = self._task_quad_group.checkedButton()
+            urg, imp = self._task_quad_data.get(selected, (True, True))
+            return edit.text(), urg, imp
+        return None
 
     def _on_reset_tasks(self):
         ret = QMessageBox.question(
@@ -5138,6 +6243,448 @@ class MainWindow(QMainWindow):
                 self._focus_history.addItem(f"{done_flag} [{date_str} {started}] {task}  {mins}m{secs:02d}s / {target}m")
         except Exception:
             pass
+
+    # ==================== 挂件页 (桌面置顶小窗口) ====================
+    def _build_widget_page(self, name: str) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(4, 2, 4, 4)
+        outer.setSpacing(12)
+
+        # 标题行
+        title_row = QHBoxLayout()
+        title_lab = QLabel(name)
+        title_lab.setStyleSheet(
+            "font-size: 22px; font-weight: 800; color: #0f172a; letter-spacing: 1px;"
+        )
+        sub_lab = QLabel("桌面置顶小窗口 · 学习信息一目了然")
+        sub_lab.setStyleSheet("color: #64748b; font-size: 13px; font-weight: 500;")
+        title_row.addWidget(title_lab)
+        title_row.addSpacing(12)
+        title_row.addWidget(sub_lab)
+        title_row.addStretch(1)
+        outer.addLayout(title_row)
+
+        # 主体: 左(启动 + 配置) | 右(预览)
+        body = QHBoxLayout()
+        body.setSpacing(12)
+
+        # ---- 左侧: 启动卡 ----
+        start_group = QGroupBox("启动桌面挂件")
+        start_group.setStyleSheet(
+            "QGroupBox { background: #ffffff; border: 1px solid #e2e8f0;"
+            "  border-top: 3px solid #f59e0b; border-radius: 12px; margin-top: 18px; padding-top: 12px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 18px; padding: 2px 12px;"
+            "  color: #f59e0b; font-size: 13px; font-weight: 700; background: transparent; }"
+        )
+        sg = QVBoxLayout(start_group)
+        sg.setContentsMargins(16, 18, 16, 16)
+        sg.setSpacing(12)
+
+        desc = QLabel(
+            "开启后, 桌面会出现一个置顶小窗口, 实时显示考研倒计时、\n"
+            "目标院校、励志语录、错题数量和今日任务进度。\n"
+            "可拖动移动到桌面任意位置, 右键菜单可切换置顶 / 关闭, 双击标题栏也可关闭。"
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #475569; font-size: 13px; line-height: 1.6;")
+        sg.addWidget(desc)
+
+        # 显示项配置
+        cfg_label = QLabel("选择挂件显示的信息:")
+        cfg_label.setStyleSheet("color: #0f172a; font-size: 13px; font-weight: 700;")
+        sg.addWidget(cfg_label)
+
+        cfg_row = QHBoxLayout()
+        cfg_row.setSpacing(10)
+        self._widget_flags: Dict[str, bool] = {
+            "countdown": True, "quote": True, "target": True,
+            "wrong": True, "task": True, "task_list": True, "pomodoro": True,
+        }
+        self._widget_checks: Dict[str, "QCheckBox"] = {}
+        flag_labels = {
+            "countdown": "倒计时", "quote": "励志语录", "target": "目标院校",
+            "wrong": "错题数", "task": "任务进度", "task_list": "任务列表", "pomodoro": "番茄时钟",
+        }
+        for k, lab in flag_labels.items():
+            cb = QCheckBox(lab)
+            cb.setChecked(True)
+            cb.setCursor(Qt.PointingHandCursor)
+            cb.setStyleSheet(
+                "QCheckBox{color:#334155;font-size:12px;font-weight:600;padding:4px 8px;"
+                "background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;}"
+                "QCheckBox::indicator{width:14px;height:14px;border-radius:4px;border:1px solid #cbd5e1;}"
+                "QCheckBox::indicator:checked{background:#f59e0b;border:1px solid #f59e0b;}"
+            )
+            cb.stateChanged.connect(lambda state, key=k: self._on_widget_flag_changed(key, state))
+            self._widget_checks[k] = cb
+            cfg_row.addWidget(cb)
+        cfg_row.addStretch(1)
+        sg.addLayout(cfg_row)
+
+        # 透明度选择
+        op_row = QHBoxLayout()
+        op_row.setSpacing(10)
+        op_lab = QLabel("挂件透明度:")
+        op_lab.setStyleSheet("color:#0f172a;font-size:13px;font-weight:700;")
+        self._widget_opacity = QComboBox()
+        self._widget_opacity.addItems(["30% (透明)", "50%", "70%", "80% (推荐)", "100% (不透明)"])
+        self._widget_opacity.setCurrentIndex(3)  # 80%
+        self._widget_opacity.setCursor(Qt.PointingHandCursor)
+        self._widget_opacity.setStyleSheet(
+            "QComboBox{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;"
+            "padding:4px 10px;color:#334155;font-size:12px;font-weight:600;min-height:24px;}"
+            "QComboBox::drop-down{border:none;width:20px;}"
+            "QComboBox QAbstractItemView{background:white;border:1px solid #e2e8f0;"
+            "selection-background-color:#f59e0b;selection-color:white;}"
+        )
+        op_row.addWidget(op_lab)
+        op_row.addWidget(self._widget_opacity, 1)
+        sg.addLayout(op_row)
+
+        # 启动按钮
+        self.btn_launch_widget = QPushButton("🚀  启动桌面挂件")
+        self.btn_launch_widget.setCursor(Qt.PointingHandCursor)
+        self.btn_launch_widget.setFixedHeight(44)
+        self.btn_launch_widget.setStyleSheet(
+            "QPushButton{background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            "  stop:0 #f59e0b, stop:1 #f97316); color: white; border: none;"
+            "  border-radius: 10px; font-size: 15px; font-weight: 800; letter-spacing: 1px;}"
+            "QPushButton:hover{background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            "  stop:0 #f97316, stop:1 #ea580c);}"
+            "QPushButton:pressed{background: #ea580c;}"
+        )
+        self.btn_launch_widget.clicked.connect(self._on_launch_widget)
+        sg.addWidget(self.btn_launch_widget)
+
+        # 状态提示 (挂件是否已开启)
+        self._widget_status = QLabel("● 挂件未开启")
+        self._widget_status.setStyleSheet("color:#94a3b8;font-size:12px;font-weight:600;")
+        sg.addWidget(self._widget_status)
+
+        # 开机自启选项
+        autostart_row = QHBoxLayout()
+        autostart_row.setSpacing(10)
+        self._autostart_check = QCheckBox("开机自启")
+        self._autostart_check.setCursor(Qt.PointingHandCursor)
+        self._autostart_check.setStyleSheet(
+            "QCheckBox{color:#334155;font-size:12px;font-weight:600;padding:4px 8px;"
+            "background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;}"
+            "QCheckBox::indicator{width:14px;height:14px;border-radius:4px;border:1px solid #cbd5e1;}"
+            "QCheckBox::indicator:checked{background:#10b981;border:1px solid #10b981;}"
+        )
+        self._autostart_check.stateChanged.connect(self._on_autostart_changed)
+        autostart_row.addWidget(self._autostart_check)
+        autostart_hint = QLabel("关机重启后自动启动桌面挂件")
+        autostart_hint.setStyleSheet("color:#64748b;font-size:11px;")
+        autostart_row.addWidget(autostart_hint)
+        autostart_row.addStretch(1)
+        sg.addLayout(autostart_row)
+
+        self._update_autostart_status()
+
+        body.addWidget(start_group, 5)
+
+        # ---- 右侧: 预览卡 ----
+        preview_group = QGroupBox("挂件预览")
+        preview_group.setStyleSheet(
+            "QGroupBox { background: #ffffff; border: 1px solid #e2e8f0;"
+            "  border-top: 3px solid #06b6d4; border-radius: 12px; margin-top: 18px; padding-top: 12px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 18px; padding: 2px 12px;"
+            "  color: #06b6d4; font-size: 13px; font-weight: 700; background: transparent; }"
+        )
+        pg = QVBoxLayout(preview_group)
+        pg.setContentsMargins(16, 18, 16, 16)
+        pg.setSpacing(10)
+
+        self._widget_preview = QLabel(self._widget_preview_text())
+        self._widget_preview.setWordWrap(True)
+        self._widget_preview.setAlignment(Qt.AlignCenter)
+        self._widget_preview.setStyleSheet(
+            "background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 10px;"
+            "padding: 18px; color: #475569; font-size: 12px; font-weight: 600;"
+        )
+        pg.addWidget(self._widget_preview)
+
+        hint = QLabel(
+            "提示:\n"
+            "• 挂件独立于主窗口运行, 关闭主程序时挂件也会关闭\n"
+            "• 挂件窗口可拖动到桌面任意位置\n"
+            "• 挂件每 30 秒自动刷新倒计时与任务进度\n"
+            "• 主题切换会同步应用到挂件"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#94a3b8;font-size:11px;font-weight:500;line-height:1.7;")
+        pg.addWidget(hint)
+        pg.addStretch(1)
+
+        body.addWidget(preview_group, 5)
+
+        outer.addLayout(body, 1)
+
+        # 挂件实例 (按需创建)
+        self._desktop_widget: Optional[DesktopWidget] = None
+        return page
+
+    def _widget_preview_text(self) -> str:
+        parts: List[str] = []
+        if self._widget_flags.get("countdown"):
+            parts.append("距考研初试  N  天")
+        if self._widget_flags.get("target"):
+            parts.append("目标院校 / 专业")
+        if self._widget_flags.get("quote"):
+            parts.append("「今日励志语录」")
+        if self._widget_flags.get("wrong") or self._widget_flags.get("task"):
+            parts.append("错题数  ·  今日任务进度")
+        if self._widget_flags.get("task_list"):
+            parts.append("📋 今日任务列表 (四象限分类)")
+        if self._widget_flags.get("pomodoro"):
+            parts.append("🍅 今日专注时长")
+        return "\n\n".join(parts) if parts else "(未选择任何信息)"
+
+    def _get_autostart_registry_path(self) -> str:
+        import sys
+        app_name = "SpringSnowExamWidget"
+        if sys.platform == "win32":
+            import winreg
+            return f"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+        return ""
+
+    def _is_autostart_enabled(self) -> bool:
+        import sys
+        if sys.platform != "win32":
+            return False
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                self._get_autostart_registry_path(),
+                0,
+                winreg.KEY_READ
+            )
+            try:
+                value, _ = winreg.QueryValueEx(key, "SpringSnowExamWidget")
+                winreg.CloseKey(key)
+                return bool(value)
+            except FileNotFoundError:
+                winreg.CloseKey(key)
+                return False
+        except Exception:
+            return False
+
+    def _set_autostart(self, enable: bool) -> bool:
+        import sys
+        import os
+        if sys.platform != "win32":
+            return False
+        try:
+            import winreg
+            key_path = self._get_autostart_registry_path()
+            key = winreg.CreateKey(
+                winreg.HKEY_CURRENT_USER, key_path
+            )
+            if enable:
+                python_exe = sys.executable
+                script_path = os.path.abspath(sys.argv[0])
+                if script_path.endswith('.py'):
+                    cmd = f'"{python_exe}" "{script_path}" --widget-only'
+                else:
+                    cmd = f'"{script_path}" --widget-only'
+                winreg.SetValueEx(key, "SpringSnowExamWidget", 0, winreg.REG_SZ, cmd)
+                
+                # 同时创建启动文件夹快捷方式作为备用
+                self._create_startup_shortcut(True)
+            else:
+                try:
+                    winreg.DeleteValue(key, "SpringSnowExamWidget")
+                except FileNotFoundError:
+                    pass
+                self._create_startup_shortcut(False)
+            winreg.CloseKey(key)
+            return True
+        except Exception as e:
+            print(f"设置开机自启失败: {e}")
+            return False
+
+    def _create_startup_shortcut(self, create: bool) -> bool:
+        import sys
+        import os
+        if sys.platform != "win32":
+            return False
+        try:
+            startup_dir = os.path.join(
+                os.environ.get("APPDATA", ""),
+                r"Microsoft\Windows\Start Menu\Programs\Startup"
+            )
+            if not os.path.isdir(startup_dir):
+                return False
+            
+            lnk_path = os.path.join(startup_dir, "春雪考研挂件.lnk")
+            
+            if create:
+                python_exe = sys.executable
+                script_path = os.path.abspath(sys.argv[0])
+                
+                try:
+                    import win32com.client
+                    shell = win32com.client.Dispatch("WScript.Shell")
+                    shortcut = shell.CreateShortcut(lnk_path)
+                    if script_path.endswith('.py'):
+                        shortcut.TargetPath = python_exe
+                        shortcut.Arguments = f'"{script_path}" --widget-only'
+                        shortcut.WorkingDirectory = os.path.dirname(script_path)
+                    else:
+                        shortcut.TargetPath = script_path
+                        shortcut.Arguments = "--widget-only"
+                    shortcut.Description = "春雪考研桌面挂件"
+                    shortcut.Save()
+                    return True
+                except ImportError:
+                    # 没有 pywin32，创建 VBS 脚本替代
+                    vbs_path = os.path.join(startup_dir, "春雪考研挂件.vbs")
+                    python_exe = sys.executable
+                    script_path = os.path.abspath(sys.argv[0])
+                    if script_path.endswith('.py'):
+                        vbs_content = f'Set oShell = CreateObject("WScript.Shell")\noShell.Run """{python_exe}"" ""{script_path}"" --widget-only, 0, False'
+                    else:
+                        vbs_content = f'Set oShell = CreateObject("WScript.Shell")\noShell.Run """{script_path}"" --widget-only, 0, False'
+                    with open(vbs_path, 'w', encoding='utf-8') as f:
+                        f.write(vbs_content)
+                    return True
+            else:
+                if os.path.exists(lnk_path):
+                    os.remove(lnk_path)
+                vbs_path = os.path.join(startup_dir, "春雪考研挂件.vbs")
+                if os.path.exists(vbs_path):
+                    os.remove(vbs_path)
+                return True
+        except Exception as e:
+            print(f"创建启动项失败: {e}")
+            return False
+
+    def _on_autostart_changed(self, state):
+        enabled = (int(state) == 2)
+        success = self._set_autostart(enabled)
+        if success:
+            self.store.settings["autostart_widget"] = enabled
+            self.store.save()
+        self._update_autostart_status()
+
+    def _update_autostart_status(self):
+        if not hasattr(self, '_autostart_check'):
+            return
+        is_enabled = self._is_autostart_enabled()
+        self._autostart_check.blockSignals(True)
+        self._autostart_check.setChecked(is_enabled)
+        self._autostart_check.blockSignals(False)
+
+        autostart_hint = self._autostart_check.parentWidget().findChild(QLabel, "")
+        for child in self._autostart_check.parentWidget().findChildren(QLabel):
+            if "关机重启" in child.text():
+                child.setText("✅ 已开启，关机重启后自动启动桌面挂件" if is_enabled else "关机重启后自动启动桌面挂件")
+                break
+
+    def _on_widget_flag_changed(self, key: str, state):
+        self._widget_flags[key] = (int(state) == 2)
+        # 更新预览
+        if hasattr(self, "_widget_preview") and self._widget_preview is not None:
+            self._widget_preview.setText(self._widget_preview_text())
+        # 若挂件已开启, 实时刷新显示项
+        w = getattr(self, "_desktop_widget", None)
+        if w is not None:
+            try:
+                w.show_flags = dict(self._widget_flags)
+                w._apply_flags()
+                w.refresh()
+            except Exception:
+                pass
+
+    def _on_launch_widget(self):
+        # 已开启: 提到最前并刷新
+        w = getattr(self, "_desktop_widget", None)
+        if w is not None:
+            try:
+                # 更新透明度
+                op_idx = self._widget_opacity.currentIndex()
+                op_map = {0: 30, 1: 50, 2: 70, 3: 80, 4: 100}
+                w.set_opacity(op_map.get(op_idx, 80))
+                w.show()
+                w.raise_()
+                w.activateWindow()
+                w.refresh()
+                self._widget_status.setText("● 挂件已开启 (已提到最前)")
+                self._widget_status.setStyleSheet("color:#10b981;font-size:12px;font-weight:600;")
+                return
+            except Exception:
+                self._desktop_widget = None
+
+        # 新建挂件
+        c = self.THEME_COLORS.get(self._current_theme, self.THEME_COLORS["light"])
+        widget = DesktopWidget(
+            self.store, theme_colors=c, show_flags=dict(self._widget_flags),
+            on_task_toggle_callback=self._on_widget_task_toggle,
+            main_window=self
+        )
+        # 设置透明度
+        op_idx = self._widget_opacity.currentIndex()
+        op_map = {0: 30, 1: 50, 2: 70, 3: 80, 4: 100}
+        widget.set_opacity(op_map.get(op_idx, 80))
+        # 默认位置: 主窗口右上角偏移
+        try:
+            gp = self.geometry()
+            widget.move(gp.x() + gp.width() - widget.width() - 40, gp.y() + 80)
+        except Exception:
+            pass
+        widget.show()
+        self._desktop_widget = widget
+        self._widget_status.setText("● 挂件已开启")
+        self._widget_status.setStyleSheet("color:#10b981;font-size:12px;font-weight:600;")
+
+    def _on_widget_task_toggle(self):
+        """挂件中任务状态变更时的回调, 用于刷新主界面"""
+        try:
+            if hasattr(self, '_rebuild_task_rows'):
+                self._rebuild_task_rows()
+            self.dash_task_progress.setText(
+                f"{self._count_done_tasks()} / {self._count_total_tasks()}  已完成"
+            )
+        except Exception:
+            pass
+
+    def _count_done_tasks(self) -> int:
+        tasks = self.store.settings.get("today_tasks") or []
+        return sum(1 for t in tasks if t.get("done"))
+
+    def _count_total_tasks(self) -> int:
+        tasks = self.store.settings.get("today_tasks") or []
+        return len(tasks)
+
+    def _refresh_widget_if_exists(self):
+        """如果挂件存在则刷新它"""
+        w = getattr(self, "_desktop_widget", None)
+        if w is not None:
+            try:
+                tasks = self.store.settings.get("today_tasks") or []
+                print(f"[挂件刷新] 当前任务数: {len(tasks)}")
+                for t in tasks:
+                    print(f"  - {t.get('text', '')} (done={t.get('done')})")
+                w.refresh()
+            except Exception as e:
+                print(f"[挂件刷新] 异常: {e}")
+        else:
+            print("[挂件刷新] 挂件未启动")
+
+    def _apply_widget_theme(self):
+        """主题切换时刷新挂件样式"""
+        c = self.THEME_COLORS.get(self._current_theme, self.THEME_COLORS["light"])
+        w = getattr(self, "_desktop_widget", None)
+        if w is not None:
+            try:
+                w.theme_colors = c
+                w._apply_style()
+                w.refresh()
+            except Exception:
+                pass
 
     def _build_pdf_page(self, name: str) -> QWidget:
         page = QWidget()
@@ -8447,14 +9994,30 @@ class MainWindow(QMainWindow):
             nav_bg="#ffffff", nav_hover="#f1f5f9", nav_active="#dbeafe",
         ),
         "dark": dict(
-            bg="#0f172a", card="#1e293b", border="#334155",
-            # 文字改为牛奶色系 (柔和不刺眼, 暖色调)
-            text="#f5f0e1",        # 主文字: 牛奶白
-            text2="#e8e3d3",       # 次要: 偏暖奶白
-            text3="#c9c2b0",       # 提示: 温润米色
-            title_bg="#020617", title_text="#faf3e0", title_border="#1e293b",  # 标题: 浓牛奶色
-            accent="#fbbf24", accent_fg="#0f172a",  # 强调色改为暖琥珀 (搭配牛奶色更和谐)
-            nav_bg="#1e293b", nav_hover="#334155", nav_active="#3a2810",  # 选中: 暖琥珀深色
+            # ========== Trae IDE 风格暗色调色板 ==========
+            # 背景分层: 标题栏最黑, 主区次黑, 卡片最浅 (VSCode/Trae 经典 3 层深度)
+            bg="#0d1117",          # 主背景 (Trae/VSCode 风格的近黑)
+            card="#161b22",        # 卡片 (工作区, 略浅)
+            sidebar="#010409",     # 侧边栏 (更深, 与主区形成层次)
+            title_bg="#010409",    # 标题栏背景 (最黑)
+            title_text="#f0e6d2",  # 标题文字: 浓牛奶色
+            title_border="#21262d",
+            border="#30363d",      # 边框: 深灰 (Trae 风格)
+
+            # 文字: 保留暖牛奶色系 (用户喜欢的护眼配色)
+            text="#f0e6d2",        # 主文字: 牛奶白
+            text2="#d4c5a8",       # 次要: 偏暖奶白
+            text3="#a89878",       # 提示: 温润米色
+
+            # 强调色: 改为 Trae 风格的绿色 (Trae 主色)
+            accent="#3fb950",      # Trae 主绿色
+            accent2="#d29922",     # 琥珀 (辅助强调)
+            accent_fg="#0d1117",   # 绿色按钮上的文字色 (深底)
+
+            # 导航栏: 比主背景更深, 模仿 Trae "侧边栏最黑" 的层次
+            nav_bg="#010409",      # 导航栏背景 (比主区 #0d1117 更深)
+            nav_hover="#21262d",   # hover 浅色
+            nav_active="#1f6f37",  # 选中: Trae 绿色深色 (和谐, 醒目)
         ),
     }
 
@@ -8479,6 +10042,7 @@ class MainWindow(QMainWindow):
         "course":    "#8b5cf6",  # violet
         "pdf":       "#06b6d4",  # cyan
         "focus":     "#ef4444",  # red
+        "widget":    "#f59e0b",  # amber (与 dashboard 同色, 挂件为桌面延伸)
     }
 
     def _refresh_nav_styles(self, theme_id: str):
@@ -8717,6 +10281,11 @@ class MainWindow(QMainWindow):
                 self.english_page._apply_theme(self.THEME_COLORS[theme_id])
         except Exception as e:
             print(f"[MainWindow._do_apply_theme] english_page._apply_theme 失败: {e}")
+        # 桌面挂件 (按主题刷新)
+        try:
+            self._apply_widget_theme()
+        except Exception as e:
+            print(f"[MainWindow._do_apply_theme] _apply_widget_theme 失败: {e}")
 
     # ===== 颜色映射: 浅色 <-> 深色 (只覆盖中性色与基础色) =====
     _COLOR_MAP_LIGHT_TO_DARK = {
@@ -8989,9 +10558,20 @@ def main() -> None:
     app.setStyle("Fusion")
     font = QFont("Microsoft YaHei", 10)
     app.setFont(font)
-    w = MainWindow()
-    w.show()
-    sys.exit(app.exec_())
+
+    widget_only = "--widget-only" in sys.argv
+    if widget_only:
+        from spring_snow_pyqt import Store, DesktopWidget, get_theme_colors, FocusStore
+        store = Store()
+        store.load_or_init()
+        theme_colors = get_theme_colors(store.settings.get("theme", "light"))
+        fw = DesktopWidget(store, theme_colors)
+        fw.show()
+        sys.exit(app.exec_())
+    else:
+        w = MainWindow()
+        w.show()
+        sys.exit(app.exec_())
 
 
 if __name__ == "__main__":
